@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
+# Prefer EGL for offscreen rendering; falls back to OSMesa (software) if EGL libs missing.
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
+
 import gradio as gr
+import imageio.v3 as iio
 import jax
+import mujoco
 import numpy as np
 import yaml
 from axswarm import SolverData, SolverSettings, solve
@@ -38,14 +45,19 @@ FREEFORM_OUT_OF_VOLUME_FRACTION_LIMIT = 0.30
 SUBJECT_PERIOD_S = 12.0
 SUBJECT_AMPLITUDE_X = 1.2
 SUBJECT_AMPLITUDE_Y = 0.6
+SUBJECT_BOX_HALF = np.array([0.25, 0.25, 0.45])
+SUBJECT_BOX_RGBA = np.array([0.85, 0.25, 0.35, 1.0])
+POV_FORWARD_OFFSET = 0.12
 
 REPO_ROOT = Path(__file__).parent
 SETTINGS_PATH = REPO_ROOT / "swarm_gpt" / "data" / "settings.yaml"
 
 SYSTEM_PROMPT = """You are a swarm-cinematography director controlling 3 drones (indices 0, 1, 2) in simulation. Output ONE JSON object only. No prose, no code fences.
 
-The "subject" is the focal entity. It is either static (default, at origin) or moves along a figure-8 path. Top-level field:
-"subject": {"motion": "static" | "figure_eight"}
+The "subject" is a moving box on the ground. By default it wanders (figure_eight). Set static only when the command clearly implies a stationary subject ("hover around this spot", "static circle"). Top-level field:
+"subject": {"motion": "figure_eight" | "random_walk" | "static"}
+
+CRITICAL: When subject motion is NOT static, orbit and follow primitives both TRACK the subject — the orbit "center" parameter is then an OFFSET from the moving subject (so center [0, 0] means orbit centered on the box wherever it goes). For dialogue scenes with two stationary actors at fixed spots (shot_reverse_shot, master_with_coverage), explicitly set subject motion to "static" and use absolute world-frame centers like [-0.7, 0] and [0.7, 0].
 
 Pick the MODE that best matches the command. Use this decision rule:
 
@@ -118,7 +130,8 @@ Decompose strategies:
 
 Primitive parameter formats:
 - orbit: {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>] (optional, default [0,0])}
-- follow: {"offset": [<dx>, <dy>] (drone trails subject by this offset, world frame), "height": <m>}
+- follow: {"offset": [<dx>, <dy>], "height": <m>}
+  IMPORTANT: "offset" MUST be a 2-element list [dx, dy] in meters (world frame). Never emit 1-element, empty, or scalar offsets. dx and dy must be distinct per drone for multi-drone coverage (e.g. drone 0 [-1.0, 0], drone 1 [0, 0.8], drone 2 [0.6, -0.6]).
 
 Hard parameter bounds:
 - orbit: radius [0.3, 2.0] m, height [0.5, 1.8] m, speed [0.1, 1.5] m/s, center each in [-2.0, 2.0] m
@@ -132,17 +145,37 @@ All modes: exactly 3 assignments (drones 0, 1, 2). Always include a non-empty ra
 # ---------- subject ----------
 
 def subject_position(t: float | np.ndarray, mode: str) -> np.ndarray:
-    """Return subject (x, y, z) at time(s) t."""
+    """Return subject (x, y, z) at time(s) t. Modes: static, figure_eight, random_walk."""
     t = np.asarray(t, dtype=np.float64)
     z = np.zeros_like(t)
     if mode == "figure_eight":
         omega = 2.0 * np.pi / SUBJECT_PERIOD_S
         x = SUBJECT_AMPLITUDE_X * np.sin(omega * t)
         y = SUBJECT_AMPLITUDE_Y * np.sin(2.0 * omega * t)
+    elif mode == "random_walk":
+        w1, w2, w3 = 2.0 * np.pi / 7.0, 2.0 * np.pi / 11.0, 2.0 * np.pi / 13.0
+        x = 0.7 * np.sin(w1 * t) + 0.4 * np.sin(w2 * t + 1.3) + 0.3 * np.cos(w3 * t + 0.7)
+        y = 0.5 * np.cos(w1 * t + 2.1) + 0.6 * np.sin(w3 * t) + 0.3 * np.cos(w2 * t + 0.5)
     else:
         x = z.copy()
         y = z.copy()
     return np.stack([x, y, z], axis=-1)
+
+
+def draw_subject(sim: Sim, t: float, motion: str) -> None:
+    """Draw the subject as a moving box on the ground."""
+    if sim.viewer is None or sim.viewer.viewer is None:
+        return
+    viewer = sim.viewer.viewer
+    pos = subject_position(t, motion)
+    box_pos = np.array([pos[0], pos[1], SUBJECT_BOX_HALF[2]], dtype=np.float64)
+    viewer.add_marker(
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=SUBJECT_BOX_HALF,
+        pos=box_pos,
+        mat=np.eye(3).flatten(),
+        rgba=SUBJECT_BOX_RGBA,
+    )
 
 
 # ---------- LLM ----------
@@ -190,14 +223,26 @@ def clamp_orbit_params(p: dict) -> dict:
     }
 
 
-def clamp_follow_params(p: dict) -> dict:
-    offset = p.get("offset") if isinstance(p.get("offset"), (list, tuple)) else [-0.8, 0.0]
+DEFAULT_FOLLOW_OFFSETS = [(-0.9, 0.0), (-0.4, 0.7), (-0.4, -0.7)]
+DEFAULT_FOLLOW_HEIGHTS = (1.5, 1.0, 0.7)
+
+
+def clamp_follow_params(p: dict, drone_idx: int = 0) -> dict:
+    dx_def, dy_def = DEFAULT_FOLLOW_OFFSETS[drone_idx % len(DEFAULT_FOLLOW_OFFSETS)]
+    h_def = DEFAULT_FOLLOW_HEIGHTS[drone_idx % len(DEFAULT_FOLLOW_HEIGHTS)]
+    raw_offset = p.get("offset")
+    if isinstance(raw_offset, (list, tuple)):
+        offset = list(raw_offset)
+    elif isinstance(raw_offset, (int, float)):
+        offset = [float(raw_offset), 0.0]
+    else:
+        offset = []
     return {
         "offset": [
-            _clip(offset[0] if len(offset) > 0 else -0.8, *OFFSET_RANGE, -0.8),
-            _clip(offset[1] if len(offset) > 1 else 0.0, *OFFSET_RANGE, 0.0),
+            _clip(offset[0] if len(offset) > 0 else dx_def, *OFFSET_RANGE, dx_def),
+            _clip(offset[1] if len(offset) > 1 else dy_def, *OFFSET_RANGE, dy_def),
         ],
-        "height": _clip(p.get("height", 1.0), *HEIGHT_RANGE, 1.0),
+        "height": _clip(p.get("height", h_def), *HEIGHT_RANGE, h_def),
     }
 
 
@@ -209,12 +254,9 @@ def follow_fallback(reason: str) -> dict:
         "rationale": f"Fallback: {reason}",
         "duration": DEFAULT_DURATION_S,
         "assignments": [
-            {"drone": 0, "role": "follow", "primitive": "follow",
-             "params": {"offset": [-0.6, 0.0], "height": 1.2}},
-            {"drone": 1, "role": "follow", "primitive": "follow",
-             "params": {"offset": [-0.4, 0.6], "height": 1.0}},
-            {"drone": 2, "role": "follow", "primitive": "follow",
-             "params": {"offset": [-0.4, -0.6], "height": 0.8}},
+            {"drone": i, "role": "follow", "primitive": "follow",
+             "params": clamp_follow_params({}, i)}
+            for i in range(N_DRONES)
         ],
     }
 
@@ -237,9 +279,9 @@ def normalize(raw: dict) -> dict:
         raise ValueError(f"Unrecognized command shape: {json.dumps(raw)[:200]}")
 
     subject = raw.get("subject")
-    motion = (subject or {}).get("motion", "static")
+    motion = (subject or {}).get("motion", "figure_eight")
     if motion not in {"static", "figure_eight"}:
-        motion = "static"
+        motion = "figure_eight"
 
     duration = _clip(raw.get("duration", DEFAULT_DURATION_S), *DURATION_RANGE, DEFAULT_DURATION_S)
     out = {
@@ -260,7 +302,7 @@ def normalize(raw: dict) -> dict:
         if prim == "orbit":
             entry["params"] = clamp_orbit_params(a.get("params", {}))
         elif prim == "follow":
-            entry["params"] = clamp_follow_params(a.get("params", {}))
+            entry["params"] = clamp_follow_params(a.get("params", {}), int(a["drone"]))
         elif prim == "freeform":
             entry["waypoints"] = a.get("waypoints", []) or []
         else:
@@ -304,19 +346,34 @@ def validate_freeform_or_fallback(parsed: dict) -> tuple[dict, str | None]:
 
 # ---------- waypoint generation ----------
 
-def _fill_orbit(pos_arr, vel_arr, times, drone_i, n_drones, params):
+def _fill_orbit(pos_arr, vel_arr, times, drone_i, n_drones, params, subject_motion):
     radius = params["radius"]
     height = params["height"]
     speed = params["speed"]
     cx, cy = params["center"]
+    if subject_motion != "static":
+        subj = subject_position(times, subject_motion)
+        cxs = subj[:, 0] + cx
+        cys = subj[:, 1] + cy
+        if len(times) > 1:
+            subj_vx = np.gradient(cxs, times)
+            subj_vy = np.gradient(cys, times)
+        else:
+            subj_vx = np.zeros_like(times)
+            subj_vy = np.zeros_like(times)
+    else:
+        cxs = np.full_like(times, cx)
+        cys = np.full_like(times, cy)
+        subj_vx = np.zeros_like(times)
+        subj_vy = np.zeros_like(times)
     omega = speed / max(radius, 1e-3)
     phase = 2.0 * np.pi * drone_i / n_drones
     angle = omega * times + phase
-    pos_arr[:, 0] = cx + radius * np.cos(angle)
-    pos_arr[:, 1] = cy + radius * np.sin(angle)
+    pos_arr[:, 0] = cxs + radius * np.cos(angle)
+    pos_arr[:, 1] = cys + radius * np.sin(angle)
     pos_arr[:, 2] = height
-    vel_arr[:, 0] = -radius * omega * np.sin(angle)
-    vel_arr[:, 1] = radius * omega * np.cos(angle)
+    vel_arr[:, 0] = subj_vx - radius * omega * np.sin(angle)
+    vel_arr[:, 1] = subj_vy + radius * omega * np.cos(angle)
     vel_arr[:, 2] = 0.0
 
 
@@ -370,7 +427,7 @@ def build_waypoints(parsed: dict) -> dict[str, np.ndarray]:
         a = by_idx[i]
         prim = a["primitive"]
         if prim == "orbit":
-            _fill_orbit(pos[i], vel[i], times, i, n, a["params"])
+            _fill_orbit(pos[i], vel[i], times, i, n, a["params"], motion)
         elif prim == "follow":
             _fill_follow(pos[i], vel[i], times, a["params"], motion)
         elif prim == "freeform":
@@ -383,7 +440,40 @@ def build_waypoints(parsed: dict) -> dict[str, np.ndarray]:
 
 # ---------- simulation ----------
 
-def run_sim(waypoints: dict, settings: dict, gui: bool = True) -> None:
+POV_HEIGHT = 240
+POV_WIDTH = 360
+POV_FPS = 4
+STATUS_HEARTBEAT_HZ = 2
+
+
+def _aim_camera_at_subject(cam, drone_pos, subject_pos):
+    drone = np.asarray(drone_pos, dtype=np.float64)
+    subj = np.asarray(subject_pos, dtype=np.float64)
+    to_subject = subj - drone
+    norm = float(np.linalg.norm(to_subject))
+    cam_world = drone + (to_subject / norm) * POV_FORWARD_OFFSET if norm > 1e-6 else drone
+    v = cam_world - subj
+    distance = float(np.linalg.norm(v))
+    cam.lookat[0] = float(subj[0])
+    cam.lookat[1] = float(subj[1])
+    cam.lookat[2] = float(subj[2])
+    cam.distance = max(distance, 0.1)
+    cam.azimuth = float(np.degrees(np.arctan2(v[1], v[0])))
+    cam.elevation = float(np.degrees(np.arctan2(v[2], np.linalg.norm(v[:2]) + 1e-6)))
+
+
+def run_sim(
+    waypoints: dict,
+    settings: dict,
+    gui: bool = True,
+    subject_motion: str = "static",
+    pov_drone_idx: int | None = None,
+):
+    """Run the sim. Generator yielding (t, pov_img_or_None) at POV_FPS.
+
+    pov_drone_idx None -> no POV rendering (img is always None).
+    Iterate fully to drive the sim to completion.
+    """
     sim = Sim(
         n_worlds=1,
         n_drones=waypoints["pos"].shape[0],
@@ -431,9 +521,22 @@ def run_sim(waypoints: dict, settings: dict, gui: bool = True) -> None:
     pos = np.asarray(sim.data.states.pos[0])
     vel = np.asarray(sim.data.states.vel[0])
 
+    pov_active = pov_drone_idx is not None and 0 <= pov_drone_idx < sim.n_drones
+    pov_viewer = None
+    if pov_active and gui:
+        try:
+            import mujoco.viewer as _mjv
+            pov_viewer = _mjv.launch_passive(
+                sim.mj_model, sim.mj_data,
+                show_left_ui=False, show_right_ui=False,
+            )
+        except Exception as exc:
+            print(f"[POV viewer] failed to open second window: {exc}", file=sys.stderr)
+            pov_viewer = None
+
     fps = 60
     print(f"Running {n_steps} sim steps ({waypoints['time'][0, -1]:.1f}s) "
-          f"with {sim.n_drones} drones; GUI={gui}")
+          f"with {sim.n_drones} drones; GUI={gui}; POV={pov_drone_idx}")
     for step in range(n_steps):
         t = step / sim.control_freq
         if step % solve_every_n_steps == 0:
@@ -450,9 +553,27 @@ def run_sim(waypoints: dict, settings: dict, gui: bool = True) -> None:
         sim.state_control(control)
         sim.step(sim.freq // sim.control_freq)
         if gui and (step * fps) % sim.control_freq < fps:
+            draw_subject(sim, t, subject_motion)
             sim.render()
+            if pov_viewer is not None:
+                try:
+                    drone_pos = np.asarray(sim.data.states.pos[0, pov_drone_idx])
+                    subj_pos = subject_position(t, subject_motion)
+                    _aim_camera_at_subject(pov_viewer.cam, drone_pos, subj_pos)
+                    pov_viewer.sync()
+                except Exception as exc:
+                    print(f"[POV viewer] {exc}", file=sys.stderr)
+        heartbeat_every = max(1, sim.control_freq // STATUS_HEARTBEAT_HZ)
+        if step % heartbeat_every == 0:
+            yield ("heartbeat", t, None)
+    if pov_viewer is not None:
+        try:
+            pov_viewer.close()
+        except Exception:
+            pass
     sim.close()
     print("Done.")
+    yield ("done", float(waypoints["time"][0, -1]), None)
 
 
 # ---------- presentation ----------
@@ -542,44 +663,88 @@ def execute(text: str, settings: dict, gui: bool) -> None:
     parsed = plan(text)
     print_summary(parsed)
     waypoints = build_waypoints(parsed)
-    run_sim(waypoints, settings, gui=gui)
+    motion = parsed.get("subject", {}).get("motion", "figure_eight")
+    for _evt in run_sim(waypoints, settings, gui=gui, subject_motion=motion):
+        pass
+
+
+def encode_pov_mp4(frames: list[np.ndarray], fps: int = POV_FPS) -> str | None:
+    if not frames:
+        return None
+    path = f"/tmp/dolly_pov_{os.getpid()}.mp4"
+    try:
+        iio.imwrite(path, np.stack(frames, axis=0), fps=fps, codec="libx264")
+        return path
+    except Exception as exc:
+        print(f"[POV encode] {exc}", file=sys.stderr)
+        return None
 
 
 def launch_ui(settings: dict) -> None:
-    def submit(text: str, show_viewer: bool) -> tuple[str, str, str]:
+    def submit(text: str, show_viewer: bool, pov_drone: str):
         text = text.strip()
         if not text:
-            return "", "", "Type a command first."
+            yield "", "", "Type a command first.", None
+            return
         try:
             parsed = plan(text)
         except Exception as exc:
-            return "", "", f"Plan error: {exc}"
+            yield "", "", f"Plan error: {exc}", None
+            return
         roles_md = render_roles_markdown(parsed)
         parsed_json = json.dumps(parsed, indent=2)
+        yield roles_md, parsed_json, "Planning complete; starting sim...", None
+
+        if pov_drone in (None, "", "off"):
+            pov_idx = None
+        else:
+            try:
+                pov_idx = int(pov_drone)
+            except (TypeError, ValueError):
+                pov_idx = None
+        effective_gui = show_viewer
+
         try:
             waypoints = build_waypoints(parsed)
-            run_sim(waypoints, settings, gui=show_viewer)
+            motion = parsed.get("subject", {}).get("motion", "figure_eight")
+            for evt in run_sim(
+                waypoints, settings,
+                gui=effective_gui, subject_motion=motion, pov_drone_idx=pov_idx,
+            ):
+                kind, t, _payload = evt
+                if kind == "heartbeat":
+                    yield roles_md, parsed_json, f"t={t:.1f}s", None
+                elif kind == "done":
+                    yield roles_md, parsed_json, "Done.", None
         except Exception as exc:
-            return roles_md, parsed_json, f"Sim error: {exc}"
-        return roles_md, parsed_json, "Done."
+            yield roles_md, parsed_json, f"Sim error: {exc}", None
+            return
 
     with gr.Blocks(title="dolly MVP") as ui:
         gr.Markdown("# dolly MVP — central-planner swarm cinematography")
         with gr.Row():
             cmd_in = gr.Textbox(
                 label="Command",
-                placeholder='Try: "cover this conversation cinematically" or "fly a figure 8 around them"',
+                placeholder='Try: "cover this play" or "circle around them slowly"',
                 scale=4,
             )
             submit_btn = gr.Button("Run", variant="primary", scale=1)
-        viewer_chk = gr.Checkbox(value=True, label="Open MuJoCo 3D viewer window")
+        with gr.Row():
+            viewer_chk = gr.Checkbox(value=True, label="Open MuJoCo 3D viewer window")
+            pov_radio = gr.Radio(
+                choices=[("Scene (default)", "off"), ("Drone 0 POV", "0"),
+                         ("Drone 1 POV", "1"), ("Drone 2 POV", "2")],
+                value="off",
+                label="MuJoCo viewer camera (camera always points at the subject)",
+            )
         roles_out = gr.Markdown(label="Director's plan")
         with gr.Row():
             parsed_out = gr.Code(label="Parsed JSON (debug)", language="json")
             status_out = gr.Textbox(label="Status", lines=4)
-        outputs = [roles_out, parsed_out, status_out]
-        submit_btn.click(submit, inputs=[cmd_in, viewer_chk], outputs=outputs)
-        cmd_in.submit(submit, inputs=[cmd_in, viewer_chk], outputs=outputs)
+        pov_out = gr.Video(visible=False)
+        outputs = [roles_out, parsed_out, status_out, pov_out]
+        submit_btn.click(submit, inputs=[cmd_in, viewer_chk, pov_radio], outputs=outputs)
+        cmd_in.submit(submit, inputs=[cmd_in, viewer_chk, pov_radio], outputs=outputs)
     ui.launch()
 
 

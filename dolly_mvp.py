@@ -1,4 +1,4 @@
-"""Terminal/web command -> OpenAI LLM -> per-drone orbit assignments -> crazyflow sim with AMSwarm."""
+"""Terminal/web command -> OpenAI LLM -> per-drone primitives -> crazyflow sim with AMSwarm."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from crazyflow.sim import Physics, Sim
 from openai import OpenAI
 
 OPENAI_MODEL = "gpt-4o"
+LLM_TIMEOUT_S = 20.0
+
 N_DRONES = 3
 DEFAULT_DURATION_S = 15.0
 WAYPOINT_DT_S = 0.25
@@ -23,44 +25,67 @@ WAYPOINT_DT_S = 0.25
 RADIUS_RANGE = (0.3, 2.0)
 HEIGHT_RANGE = (0.5, 1.8)
 SPEED_RANGE = (0.1, 1.5)
+OFFSET_RANGE = (-1.5, 1.5)
 CENTER_RANGE = (-2.0, 2.0)
+DURATION_RANGE = (5.0, 30.0)
+FREEFORM_VOLUME_X = (-2.5, 2.5)
+FREEFORM_VOLUME_Y = (-2.5, 2.5)
+FREEFORM_VOLUME_Z = (0.5, 1.8)
+FREEFORM_MIN_WAYPOINTS = 2
+FREEFORM_MAX_WAYPOINTS = 12
+FREEFORM_OUT_OF_VOLUME_FRACTION_LIMIT = 0.30
+
+SUBJECT_PERIOD_S = 12.0
+SUBJECT_AMPLITUDE_X = 1.2
+SUBJECT_AMPLITUDE_Y = 0.6
 
 REPO_ROOT = Path(__file__).parent
 SETTINGS_PATH = REPO_ROOT / "swarm_gpt" / "data" / "settings.yaml"
 
-SYSTEM_PROMPT = """You are a swarm-cinematography director controlling 3 drones (indices 0, 1, 2) flying in simulation. Output ONE JSON object only. No prose, no code fences.
+SYSTEM_PROMPT = """You are a swarm-cinematography director controlling 3 drones (indices 0, 1, 2) in simulation. Output ONE JSON object only. No prose, no code fences.
 
-Pick ONE of two modes based on the command:
+The "subject" is the focal entity. It is either static (default, at origin) or moves along a figure-8 path. Top-level field:
+"subject": {"motion": "static" | "figure_eight"}
 
-(A) "primitive" — when the user asks for a simple orbit/circle and does NOT imply distinct camera angles:
+Pick the MODE that best matches the command. Use this decision rule:
+
+1. If the command names a SPECIFIC NON-ORBITAL SHAPE, PATH, or CREATIVE MOTION ("figure 8", "figure-eight", "heart", "spiral", "weave between X and Y", "trace a letter", "fly through a gate", "swoosh", "S-curve", "spell"), choose "freeform" and emit waypoints. Do NOT shoehorn into orbit.
+2. Else, if the command implies coordinated multi-role COVERAGE of a subject ("cover this", "give me coverage", "film cinematically", "capture from all angles", "shot reverse shot", "master with coverage"), choose "decompose" with a named strategy.
+3. Else, if the command names a known SHOT TYPE cleanly ("orbit", "circle", "follow", "hero shot"), choose "primitive".
+4. When ambiguous between freeform and primitive, prefer freeform if the command suggests a creative or shape-specific motion; prefer primitive only when it's a plain orbit/circle/follow with no shape qualifier.
+
+Don't default to orbit. Orbit is for circular motion only. If the command says "figure 8", "heart", "weave", or any non-circular path, use freeform.
+
+(A) "primitive" — one shot type, all drones share params, phase offsets handled by runtime:
 {
   "mode": "primitive",
-  "strategy": "single_orbit",
+  "subject": {"motion": "static"},
+  "strategy": "single_orbit" | "follow_train",
   "rationale": "<one sentence>",
   "assignments": [
-    {"drone": 0, "role": "orbit", "primitive": "orbit", "params": {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>]}},
-    {"drone": 1, "role": "orbit", "primitive": "orbit", "params": {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>]}},
-    {"drone": 2, "role": "orbit", "primitive": "orbit", "params": {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>]}}
+    {"drone": 0, "role": "<role>", "primitive": "orbit"|"follow", "params": {...}},
+    {"drone": 1, ...},
+    {"drone": 2, ...}
   ]
 }
-For single_orbit all three drones MUST share the same params; phase offsets are added by the runtime.
 
-(B) "decompose" — when the user implies coverage of a subject (e.g. "cover this", "give me coverage", "film this cinematically", "shot reverse shot"). Pick ONE strategy and give each drone a distinct role with its own params:
+(B) "decompose" — coordinated multi-role coverage (each drone gets distinct params/role):
 {
   "mode": "decompose",
-  "strategy": "<full_coverage|triangulation|lead_chase|hero_with_context|crowd_reaction|shot_reverse_shot|master_with_coverage|over_the_shoulder|high_low|bullet_time|reveal_arc|goal_to_goal>",
-  "rationale": "<one sentence justifying why this strategy fits the command>",
+  "subject": {"motion": "static"|"figure_eight"},
+  "strategy": "<one of the strategies below>",
+  "rationale": "<one sentence justifying the strategy choice>",
   "assignments": [
-    {"drone": 0, "role": "<role>", "primitive": "orbit", "params": {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>]}},
-    {"drone": 1, "role": "<role>", "primitive": "orbit", "params": {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>]}},
-    {"drone": 2, "role": "<role>", "primitive": "orbit", "params": {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>]}}
+    {"drone": 0, "role": "<role>", "primitive": "orbit"|"follow", "params": {...}},
+    {"drone": 1, ...},
+    {"drone": 2, ...}
   ]
 }
 
 Decompose strategies:
 - full_coverage: wide_establish + close_follow + side_angle (3 distinct framings of same subject).
 - triangulation: ~120° angular separation around subject; vary heights for 3D capture.
-- lead_chase: same radius and height; phase offsets so drones lead/middle/trail.
+- lead_chase: same radius and height; phase offsets so drones lead/middle/trail (orbit only).
 - hero_with_context: drone 0 hero low close; drones 1-2 wide and high, behind.
 - crowd_reaction: drone 0 on subject; drones 1-2 turned outward, capturing audience.
 - shot_reverse_shot: dialogue coverage. Drone 0 orbits left actor (center ≈ [-0.7, 0]); drone 1 orbits right actor (center ≈ [0.7, 0]); drone 2 wide (center origin, large radius).
@@ -71,31 +96,79 @@ Decompose strategies:
 - reveal_arc: drones start near center (small radius) — visually a slow expanding orbit.
 - goal_to_goal: drones at distinct centers along x-axis ([-1.5, 0], [0, 0], [1.5, 0]), small radii, all facing center.
 
-Role-to-parameter visual encoding (each drone executes as an orbit with its own radius/height/speed/center):
-- wide_establish: radius 1.5–2.0m, height 1.5–1.8m, speed 0.2–0.4 m/s
-- close_follow:   radius 0.4–0.8m, height 0.9–1.2m, speed 0.6–1.0 m/s
-- side_angle:     radius 1.0–1.5m, height 0.5–0.8m, speed 0.4–0.7 m/s
-- hero_low:       radius 0.4–0.6m, height 0.5–0.7m, speed 0.5–0.8 m/s
-- context_back:   radius 1.7–2.0m, height 1.4–1.7m, speed 0.2–0.4 m/s
-- audience:       radius 1.2–1.5m, height 0.9–1.1m, speed 0.3–0.5 m/s
+(C) "freeform" — only when no primitive fits ("figure 8 around the actors", "heart shape", "spell W", "fly through gate"):
+{
+  "mode": "freeform",
+  "subject": {"motion": "static"},
+  "strategy": "<short_descriptor>",
+  "rationale": "<one sentence justifying why no primitive fits>",
+  "duration": <seconds, 5-30>,
+  "assignments": [
+    {
+      "drone": 0, "role": "<role>", "primitive": "freeform",
+      "waypoints": [
+        {"t": 0.0, "x": <m>, "y": <m>, "z": <m>},
+        ...
+      ]
+    },
+    {"drone": 1, ...},
+    {"drone": 2, ...}
+  ]
+}
 
-Hard parameter bounds (clamp to these): radius in [0.3, 2.0]m, height in [0.5, 1.8]m, speed in [0.1, 1.5]m/s, center in [-2.0, 2.0]m on each axis.
-Always emit exactly 3 assignments (drones 0, 1, 2) and ALWAYS include a non-empty rationale."""
+Primitive parameter formats:
+- orbit: {"radius": <m>, "height": <m>, "speed": <m/s>, "center": [<x>, <y>] (optional, default [0,0])}
+- follow: {"offset": [<dx>, <dy>] (drone trails subject by this offset, world frame), "height": <m>}
+
+Hard parameter bounds:
+- orbit: radius [0.3, 2.0] m, height [0.5, 1.8] m, speed [0.1, 1.5] m/s, center each in [-2.0, 2.0] m
+- follow: |offset_x|, |offset_y| ≤ 1.5 m; height [0.5, 1.8] m
+- freeform: emit 6-10 waypoints per drone (denser = smoother). t strictly increasing, start 0.0, end at duration. x,y in [-2.5, 2.5] m, z in [0.5, 1.8] m. Vary trajectories per drone — three identical paths defeat the point. NEVER emit fewer than 6 waypoints unless the path is genuinely a single straight segment.
+- duration in [5, 30] s
+
+All modes: exactly 3 assignments (drones 0, 1, 2). Always include a non-empty rationale."""
 
 
-def parse_command(text: str) -> dict:
+# ---------- subject ----------
+
+def subject_position(t: float | np.ndarray, mode: str) -> np.ndarray:
+    """Return subject (x, y, z) at time(s) t."""
+    t = np.asarray(t, dtype=np.float64)
+    z = np.zeros_like(t)
+    if mode == "figure_eight":
+        omega = 2.0 * np.pi / SUBJECT_PERIOD_S
+        x = SUBJECT_AMPLITUDE_X * np.sin(omega * t)
+        y = SUBJECT_AMPLITUDE_Y * np.sin(2.0 * omega * t)
+    else:
+        x = z.copy()
+        y = z.copy()
+    return np.stack([x, y, z], axis=-1)
+
+
+# ---------- LLM ----------
+
+def parse_command(text: str) -> tuple[dict | None, str | None]:
     client = OpenAI()
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        max_tokens=600,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-    )
-    return json.loads(resp.choices[0].message.content)
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_tokens=1800,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            timeout=LLM_TIMEOUT_S,
+        )
+    except Exception as exc:
+        return None, f"LLM call failed: {exc}"
+    try:
+        return json.loads(resp.choices[0].message.content), None
+    except json.JSONDecodeError as exc:
+        return None, f"JSON parse error: {exc}"
 
+
+# ---------- normalization & validation ----------
 
 def _clip(v, lo, hi, default):
     try:
@@ -117,68 +190,198 @@ def clamp_orbit_params(p: dict) -> dict:
     }
 
 
+def clamp_follow_params(p: dict) -> dict:
+    offset = p.get("offset") if isinstance(p.get("offset"), (list, tuple)) else [-0.8, 0.0]
+    return {
+        "offset": [
+            _clip(offset[0] if len(offset) > 0 else -0.8, *OFFSET_RANGE, -0.8),
+            _clip(offset[1] if len(offset) > 1 else 0.0, *OFFSET_RANGE, 0.0),
+        ],
+        "height": _clip(p.get("height", 1.0), *HEIGHT_RANGE, 1.0),
+    }
+
+
+def follow_fallback(reason: str) -> dict:
+    return {
+        "mode": "primitive",
+        "subject": {"motion": "figure_eight"},
+        "strategy": "follow_train",
+        "rationale": f"Fallback: {reason}",
+        "duration": DEFAULT_DURATION_S,
+        "assignments": [
+            {"drone": 0, "role": "follow", "primitive": "follow",
+             "params": {"offset": [-0.6, 0.0], "height": 1.2}},
+            {"drone": 1, "role": "follow", "primitive": "follow",
+             "params": {"offset": [-0.4, 0.6], "height": 1.0}},
+            {"drone": 2, "role": "follow", "primitive": "follow",
+             "params": {"offset": [-0.4, -0.6], "height": 0.8}},
+        ],
+    }
+
+
 def normalize(raw: dict) -> dict:
-    """Produce {mode, strategy, rationale, assignments[3]} with clamped params."""
-    if isinstance(raw.get("assignments"), list) and raw["assignments"]:
-        out = {
-            "mode": str(raw.get("mode", "primitive")),
-            "strategy": str(raw.get("strategy", "single_orbit")),
-            "rationale": str(raw.get("rationale", "") or ""),
-            "assignments": [
-                {
-                    "drone": int(a["drone"]),
-                    "role": str(a.get("role", "orbit")),
-                    "primitive": str(a.get("primitive", "orbit")),
-                    "params": clamp_orbit_params(a.get("params", {})),
-                }
-                for a in raw["assignments"]
-            ],
+    if not isinstance(raw.get("assignments"), list) or not raw["assignments"]:
+        if raw.get("primitive") == "orbit" and isinstance(raw.get("params"), dict):
+            p = clamp_orbit_params(raw["params"])
+            return {
+                "mode": "primitive",
+                "subject": {"motion": "static"},
+                "strategy": "single_orbit",
+                "rationale": "Legacy single-primitive command; replicated across drones.",
+                "duration": DEFAULT_DURATION_S,
+                "assignments": [
+                    {"drone": i, "role": "orbit", "primitive": "orbit", "params": p}
+                    for i in range(N_DRONES)
+                ],
+            }
+        raise ValueError(f"Unrecognized command shape: {json.dumps(raw)[:200]}")
+
+    subject = raw.get("subject")
+    motion = (subject or {}).get("motion", "static")
+    if motion not in {"static", "figure_eight"}:
+        motion = "static"
+
+    duration = _clip(raw.get("duration", DEFAULT_DURATION_S), *DURATION_RANGE, DEFAULT_DURATION_S)
+    out = {
+        "mode": str(raw.get("mode", "primitive")),
+        "subject": {"motion": motion},
+        "strategy": str(raw.get("strategy", "single_orbit")),
+        "rationale": str(raw.get("rationale", "") or ""),
+        "duration": duration,
+        "assignments": [],
+    }
+    for a in raw["assignments"]:
+        prim = str(a.get("primitive", "orbit"))
+        entry: dict = {
+            "drone": int(a["drone"]),
+            "role": str(a.get("role", prim)),
+            "primitive": prim,
         }
-        out["assignments"].sort(key=lambda x: x["drone"])
-        return out
-    if raw.get("primitive") == "orbit" and isinstance(raw.get("params"), dict):
-        p = clamp_orbit_params(raw["params"])
-        return {
-            "mode": "primitive",
-            "strategy": "single_orbit",
-            "rationale": "Legacy single-primitive command; replicated across drones.",
-            "assignments": [
-                {"drone": i, "role": "orbit", "primitive": "orbit", "params": p}
-                for i in range(N_DRONES)
-            ],
-        }
-    raise ValueError(f"Unrecognized command shape: {json.dumps(raw)[:200]}")
+        if prim == "orbit":
+            entry["params"] = clamp_orbit_params(a.get("params", {}))
+        elif prim == "follow":
+            entry["params"] = clamp_follow_params(a.get("params", {}))
+        elif prim == "freeform":
+            entry["waypoints"] = a.get("waypoints", []) or []
+        else:
+            entry["primitive"] = "orbit"
+            entry["params"] = clamp_orbit_params(a.get("params", {}))
+        out["assignments"].append(entry)
+    out["assignments"].sort(key=lambda x: x["drone"])
+    return out
 
 
-def build_waypoints(
-    assignments: list[dict],
-    duration: float = DEFAULT_DURATION_S,
-    dt: float = WAYPOINT_DT_S,
-) -> dict[str, np.ndarray]:
-    n = len(assignments)
-    n_samples = max(2, int(np.ceil(duration / dt)) + 1)
+def validate_freeform_or_fallback(parsed: dict) -> tuple[dict, str | None]:
+    """If parsed is freeform and fails the validation rules, return follow fallback."""
+    if parsed.get("mode") != "freeform":
+        return parsed, None
+    issues: list[str] = []
+    total_wp = 0
+    out_of_vol = 0
+    for a in parsed["assignments"]:
+        wps = a.get("waypoints", [])
+        n = len(wps)
+        if not (FREEFORM_MIN_WAYPOINTS <= n <= FREEFORM_MAX_WAYPOINTS):
+            issues.append(f"drone {a['drone']}: {n} waypoints (need {FREEFORM_MIN_WAYPOINTS}-{FREEFORM_MAX_WAYPOINTS})")
+        total_wp += n
+        for w in wps:
+            try:
+                x, y, z = float(w["x"]), float(w["y"]), float(w["z"])
+            except (TypeError, KeyError, ValueError):
+                out_of_vol += 1
+                continue
+            if not (FREEFORM_VOLUME_X[0] <= x <= FREEFORM_VOLUME_X[1] and
+                    FREEFORM_VOLUME_Y[0] <= y <= FREEFORM_VOLUME_Y[1] and
+                    FREEFORM_VOLUME_Z[0] <= z <= FREEFORM_VOLUME_Z[1]):
+                out_of_vol += 1
+    frac = (out_of_vol / total_wp) if total_wp else 1.0
+    if frac > FREEFORM_OUT_OF_VOLUME_FRACTION_LIMIT:
+        issues.append(f"{out_of_vol}/{total_wp} waypoints out of volume ({frac:.0%} > {FREEFORM_OUT_OF_VOLUME_FRACTION_LIMIT:.0%})")
+    if issues:
+        return follow_fallback("freeform validation: " + "; ".join(issues)), "; ".join(issues)
+    return parsed, None
+
+
+# ---------- waypoint generation ----------
+
+def _fill_orbit(pos_arr, vel_arr, times, drone_i, n_drones, params):
+    radius = params["radius"]
+    height = params["height"]
+    speed = params["speed"]
+    cx, cy = params["center"]
+    omega = speed / max(radius, 1e-3)
+    phase = 2.0 * np.pi * drone_i / n_drones
+    angle = omega * times + phase
+    pos_arr[:, 0] = cx + radius * np.cos(angle)
+    pos_arr[:, 1] = cy + radius * np.sin(angle)
+    pos_arr[:, 2] = height
+    vel_arr[:, 0] = -radius * omega * np.sin(angle)
+    vel_arr[:, 1] = radius * omega * np.cos(angle)
+    vel_arr[:, 2] = 0.0
+
+
+def _fill_follow(pos_arr, vel_arr, times, params, subject_motion):
+    dx, dy = params["offset"]
+    height = params["height"]
+    subj = subject_position(times, subject_motion)
+    pos_arr[:, 0] = subj[:, 0] + dx
+    pos_arr[:, 1] = subj[:, 1] + dy
+    pos_arr[:, 2] = height
+    if len(times) > 1:
+        dt_arr = np.diff(times)[:, None]
+        vel_arr[:-1] = np.diff(pos_arr, axis=0) / dt_arr
+        vel_arr[-1] = vel_arr[-2]
+
+
+def _fill_freeform(pos_arr, vel_arr, times, waypoints):
+    cleaned: list[tuple[float, float, float, float]] = []
+    last_t = -np.inf
+    for w in waypoints:
+        try:
+            tt, xx, yy, zz = float(w["t"]), float(w["x"]), float(w["y"]), float(w["z"])
+        except (TypeError, KeyError, ValueError):
+            continue
+        if any(np.isnan(v) for v in (tt, xx, yy, zz)) or tt <= last_t:
+            continue
+        cleaned.append((tt, xx, yy, zz))
+        last_t = tt
+    if len(cleaned) < 2:
+        raise ValueError(f"freeform: only {len(cleaned)} valid waypoint(s)")
+    arr = np.array(cleaned, dtype=np.float64)
+    pos_arr[:, 0] = np.clip(np.interp(times, arr[:, 0], arr[:, 1]), *FREEFORM_VOLUME_X)
+    pos_arr[:, 1] = np.clip(np.interp(times, arr[:, 0], arr[:, 2]), *FREEFORM_VOLUME_Y)
+    pos_arr[:, 2] = np.clip(np.interp(times, arr[:, 0], arr[:, 3]), *FREEFORM_VOLUME_Z)
+    if len(times) > 1:
+        dt_arr = np.diff(times)[:, None]
+        vel_arr[:-1] = np.diff(pos_arr, axis=0) / dt_arr
+        vel_arr[-1] = vel_arr[-2]
+
+
+def build_waypoints(parsed: dict) -> dict[str, np.ndarray]:
+    duration = float(parsed.get("duration", DEFAULT_DURATION_S))
+    motion = parsed.get("subject", {}).get("motion", "static")
+    n = len(parsed["assignments"])
+    n_samples = max(2, int(np.ceil(duration / WAYPOINT_DT_S)) + 1)
     times = np.linspace(0.0, duration, n_samples)
     pos = np.zeros((n, n_samples, 3), dtype=np.float64)
     vel = np.zeros((n, n_samples, 3), dtype=np.float64)
-    by_idx = {int(a["drone"]): a for a in assignments}
+    by_idx = {int(a["drone"]): a for a in parsed["assignments"]}
     for i in range(n):
         a = by_idx[i]
-        p = a["params"]
-        radius = p["radius"]
-        height = p["height"]
-        speed = p["speed"]
-        cx, cy = p["center"]
-        omega = speed / max(radius, 1e-3)
-        phase = 2.0 * np.pi * i / n
-        angle = omega * times + phase
-        pos[i, :, 0] = cx + radius * np.cos(angle)
-        pos[i, :, 1] = cy + radius * np.sin(angle)
-        pos[i, :, 2] = height
-        vel[i, :, 0] = -radius * omega * np.sin(angle)
-        vel[i, :, 1] = radius * omega * np.cos(angle)
+        prim = a["primitive"]
+        if prim == "orbit":
+            _fill_orbit(pos[i], vel[i], times, i, n, a["params"])
+        elif prim == "follow":
+            _fill_follow(pos[i], vel[i], times, a["params"], motion)
+        elif prim == "freeform":
+            _fill_freeform(pos[i], vel[i], times, a.get("waypoints", []))
+        else:
+            raise ValueError(f"Unknown primitive: {prim}")
     t = np.tile(times, (n, 1))
     return {"time": t, "pos": pos, "vel": vel, "acc": np.zeros_like(pos)}
 
+
+# ---------- simulation ----------
 
 def run_sim(waypoints: dict, settings: dict, gui: bool = True) -> None:
     sim = Sim(
@@ -252,49 +455,93 @@ def run_sim(waypoints: dict, settings: dict, gui: bool = True) -> None:
     print("Done.")
 
 
+# ---------- presentation ----------
+
 def render_roles_markdown(parsed: dict) -> str:
+    motion = parsed.get("subject", {}).get("motion", "static")
     head = [
-        f"**Mode:** `{parsed['mode']}` &nbsp;&nbsp; **Strategy:** `{parsed['strategy']}`",
+        f"**Mode:** `{parsed['mode']}` &nbsp;&nbsp; "
+        f"**Strategy:** `{parsed['strategy']}` &nbsp;&nbsp; "
+        f"**Subject:** `{motion}` &nbsp;&nbsp; "
+        f"**Duration:** {parsed.get('duration', DEFAULT_DURATION_S):.1f}s",
         "",
         f"_{parsed.get('rationale', '') or '(no rationale)'}_",
         "",
-        "| Drone | Role | Radius | Height | Speed | Center |",
-        "|---|---|---|---|---|---|",
     ]
+    if parsed["mode"] == "freeform":
+        rows = ["| Drone | Role | # waypoints | bbox x | bbox y | bbox z |",
+                "|---|---|---|---|---|---|"]
+        for a in parsed["assignments"]:
+            wps = a.get("waypoints", [])
+            if wps:
+                xs = [float(w.get("x", 0)) for w in wps if isinstance(w, dict)]
+                ys = [float(w.get("y", 0)) for w in wps if isinstance(w, dict)]
+                zs = [float(w.get("z", 0)) for w in wps if isinstance(w, dict)]
+                bx = f"[{min(xs):.2f}, {max(xs):.2f}]" if xs else "—"
+                by = f"[{min(ys):.2f}, {max(ys):.2f}]" if ys else "—"
+                bz = f"[{min(zs):.2f}, {max(zs):.2f}]" if zs else "—"
+            else:
+                bx = by = bz = "—"
+            rows.append(f"| {a['drone']} | `{a['role']}` | {len(wps)} | {bx} | {by} | {bz} |")
+        return "\n".join(head + rows)
+
+    rows = ["| Drone | Role | Primitive | Params |", "|---|---|---|---|"]
     for a in parsed["assignments"]:
-        p = a["params"]
-        head.append(
-            f"| {a['drone']} | `{a['role']}` | {p['radius']:.2f} m | "
-            f"{p['height']:.2f} m | {p['speed']:.2f} m/s | "
-            f"[{p['center'][0]:.2f}, {p['center'][1]:.2f}] |"
-        )
-    return "\n".join(head)
+        prim = a["primitive"]
+        p = a.get("params", {})
+        if prim == "orbit":
+            params_md = (f"r={p['radius']:.2f}m, h={p['height']:.2f}m, "
+                         f"v={p['speed']:.2f}m/s, c=[{p['center'][0]:.2f}, {p['center'][1]:.2f}]")
+        elif prim == "follow":
+            params_md = (f"offset=[{p['offset'][0]:.2f}, {p['offset'][1]:.2f}], "
+                         f"h={p['height']:.2f}m")
+        else:
+            params_md = "—"
+        rows.append(f"| {a['drone']} | `{a['role']}` | `{prim}` | {params_md} |")
+    return "\n".join(head + rows)
 
 
 def print_summary(parsed: dict) -> None:
-    print(f"Mode: {parsed['mode']} | Strategy: {parsed['strategy']}")
+    motion = parsed.get("subject", {}).get("motion", "static")
+    print(f"Mode: {parsed['mode']} | Strategy: {parsed['strategy']} | Subject: {motion} "
+          f"| Duration: {parsed.get('duration', DEFAULT_DURATION_S):.1f}s")
     if parsed.get("rationale"):
         print(f"Rationale: {parsed['rationale']}")
     for a in parsed["assignments"]:
-        p = a["params"]
-        print(
-            f"  drone {a['drone']}  role={a['role']:<18}  "
-            f"r={p['radius']:.2f}m  h={p['height']:.2f}m  v={p['speed']:.2f}m/s  "
-            f"c=[{p['center'][0]:.2f},{p['center'][1]:.2f}]"
-        )
+        prim = a["primitive"]
+        if prim == "freeform":
+            print(f"  drone {a['drone']}  role={a['role']:<18}  freeform: {len(a.get('waypoints', []))} waypoints")
+        elif prim == "orbit":
+            p = a["params"]
+            print(f"  drone {a['drone']}  role={a['role']:<18}  orbit  "
+                  f"r={p['radius']:.2f}m  h={p['height']:.2f}m  v={p['speed']:.2f}m/s  "
+                  f"c=[{p['center'][0]:.2f},{p['center'][1]:.2f}]")
+        elif prim == "follow":
+            p = a["params"]
+            print(f"  drone {a['drone']}  role={a['role']:<18}  follow "
+                  f"offset=[{p['offset'][0]:.2f},{p['offset'][1]:.2f}]  h={p['height']:.2f}m")
 
 
-def argv_command() -> str:
-    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
-    return " ".join(positional).strip()
+# ---------- entrypoints ----------
+
+def plan(text: str) -> dict:
+    """Take a natural-language command, return a normalized plan (with fallbacks applied)."""
+    raw, err = parse_command(text)
+    if raw is None:
+        return follow_fallback(err or "LLM call failed")
+    try:
+        normalized = normalize(raw)
+    except Exception as exc:
+        return follow_fallback(f"normalize: {exc}")
+    final, _ = validate_freeform_or_fallback(normalized)
+    return final
 
 
 def execute(text: str, settings: dict, gui: bool) -> None:
     print(f"Parsing: {text!r}")
-    raw = parse_command(text)
-    parsed = normalize(raw)
+    parsed = plan(text)
     print_summary(parsed)
-    waypoints = build_waypoints(parsed["assignments"])
+    waypoints = build_waypoints(parsed)
     run_sim(waypoints, settings, gui=gui)
 
 
@@ -304,25 +551,24 @@ def launch_ui(settings: dict) -> None:
         if not text:
             return "", "", "Type a command first."
         try:
-            raw = parse_command(text)
-            parsed = normalize(raw)
+            parsed = plan(text)
         except Exception as exc:
-            return "", "", f"LLM/parse error: {exc}"
+            return "", "", f"Plan error: {exc}"
         roles_md = render_roles_markdown(parsed)
         parsed_json = json.dumps(parsed, indent=2)
         try:
-            waypoints = build_waypoints(parsed["assignments"])
+            waypoints = build_waypoints(parsed)
             run_sim(waypoints, settings, gui=show_viewer)
         except Exception as exc:
             return roles_md, parsed_json, f"Sim error: {exc}"
-        return roles_md, parsed_json, f"Done. {N_DRONES} drones, {DEFAULT_DURATION_S:.0f}s flown."
+        return roles_md, parsed_json, "Done."
 
     with gr.Blocks(title="dolly MVP") as ui:
         gr.Markdown("# dolly MVP — central-planner swarm cinematography")
         with gr.Row():
             cmd_in = gr.Textbox(
                 label="Command",
-                placeholder='Try: "cover this play" or "shot reverse shot of two actors"',
+                placeholder='Try: "cover this conversation cinematically" or "fly a figure 8 around them"',
                 scale=4,
             )
             submit_btn = gr.Button("Run", variant="primary", scale=1)
@@ -335,6 +581,11 @@ def launch_ui(settings: dict) -> None:
         submit_btn.click(submit, inputs=[cmd_in, viewer_chk], outputs=outputs)
         cmd_in.submit(submit, inputs=[cmd_in, viewer_chk], outputs=outputs)
     ui.launch()
+
+
+def argv_command() -> str:
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    return " ".join(positional).strip()
 
 
 def main() -> None:

@@ -5,11 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
-
-# Prefer EGL for offscreen rendering; falls back to OSMesa (software) if EGL libs missing.
-os.environ.setdefault("MUJOCO_GL", "egl")
-os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 
 import gradio as gr
 import imageio.v3 as iio
@@ -51,6 +48,29 @@ POV_FORWARD_OFFSET = 0.12
 
 REPO_ROOT = Path(__file__).parent
 SETTINGS_PATH = REPO_ROOT / "swarm_gpt" / "data" / "settings.yaml"
+
+_live_pov_drone: int | None = None
+_live_pov_lock = threading.Lock()
+
+
+def set_live_pov(value) -> None:
+    """Update which drone the POV camera follows. Called by the Gradio radio change event."""
+    global _live_pov_drone
+    if value in (None, "", "off"):
+        new = None
+    else:
+        try:
+            new = int(value)
+        except (TypeError, ValueError):
+            new = None
+    with _live_pov_lock:
+        _live_pov_drone = new
+    print(f"[POV] live switch -> drone {new}", file=sys.stderr)
+
+
+def get_live_pov() -> int | None:
+    with _live_pov_lock:
+        return _live_pov_drone
 
 SYSTEM_PROMPT = """You are a swarm-cinematography director controlling 3 drones (indices 0, 1, 2) in simulation. Output ONE JSON object only. No prose, no code fences.
 
@@ -163,7 +183,7 @@ def subject_position(t: float | np.ndarray, mode: str) -> np.ndarray:
 
 
 def draw_subject(sim: Sim, t: float, motion: str) -> None:
-    """Draw the subject as a moving box on the ground."""
+    """Draw the subject as a moving box on the ground (scene viewer only)."""
     if sim.viewer is None or sim.viewer.viewer is None:
         return
     viewer = sim.viewer.viewer
@@ -176,6 +196,31 @@ def draw_subject(sim: Sim, t: float, motion: str) -> None:
         mat=np.eye(3).flatten(),
         rgba=SUBJECT_BOX_RGBA,
     )
+
+
+def draw_subject_on_handle(handle, t: float, motion: str) -> None:
+    """Add the subject box to a mujoco passive-viewer Handle's user_scn."""
+    if handle is None:
+        return
+    try:
+        scn = handle.user_scn
+        if scn.maxgeom == 0:
+            return
+        pos = subject_position(t, motion)
+        box_pos = np.array([pos[0], pos[1], SUBJECT_BOX_HALF[2]], dtype=np.float64)
+        with handle.lock():
+            scn.ngeom = 1
+            g = scn.geoms[0]
+            mujoco.mjv_initGeom(
+                g,
+                int(mujoco.mjtGeom.mjGEOM_BOX),
+                np.asarray(SUBJECT_BOX_HALF, dtype=np.float64),
+                box_pos,
+                np.eye(3).flatten().astype(np.float64),
+                np.asarray(SUBJECT_BOX_RGBA, dtype=np.float32),
+            )
+    except Exception as exc:
+        print(f"[POV box] {exc}", file=sys.stderr)
 
 
 # ---------- LLM ----------
@@ -467,11 +512,12 @@ def run_sim(
     settings: dict,
     gui: bool = True,
     subject_motion: str = "static",
-    pov_drone_idx: int | None = None,
+    pov_drone_indices: list[int] | None = None,
 ):
-    """Run the sim. Generator yielding (t, pov_img_or_None) at POV_FPS.
+    """Run the sim. Generator yielding ('heartbeat'|'done', t, None).
 
-    pov_drone_idx None -> no POV rendering (img is always None).
+    pov_drone_indices: list of drone indices to open POV viewer windows for.
+    Each opens its own MuJoCo passive viewer alongside the scene viewer.
     Iterate fully to drive the sim to completion.
     """
     sim = Sim(
@@ -521,22 +567,24 @@ def run_sim(
     pos = np.asarray(sim.data.states.pos[0])
     vel = np.asarray(sim.data.states.vel[0])
 
-    pov_active = pov_drone_idx is not None and 0 <= pov_drone_idx < sim.n_drones
+    # Second MuJoCo viewer for the drone POV; stays in lockstep with the scene viewer.
     pov_viewer = None
-    if pov_active and gui:
+    if pov_drone_indices and gui:
         try:
             import mujoco.viewer as _mjv
             pov_viewer = _mjv.launch_passive(
                 sim.mj_model, sim.mj_data,
                 show_left_ui=False, show_right_ui=False,
             )
+            initial = next((i for i in pov_drone_indices if 0 <= i < sim.n_drones), 0)
+            set_live_pov(str(initial))
         except Exception as exc:
-            print(f"[POV viewer] failed to open second window: {exc}", file=sys.stderr)
+            print(f"[POV viewer] {exc}", file=sys.stderr)
             pov_viewer = None
 
     fps = 60
     print(f"Running {n_steps} sim steps ({waypoints['time'][0, -1]:.1f}s) "
-          f"with {sim.n_drones} drones; GUI={gui}; POV={pov_drone_idx}")
+          f"with {sim.n_drones} drones; GUI={gui}; POV={pov_drone_indices}")
     for step in range(n_steps):
         t = step / sim.control_freq
         if step % solve_every_n_steps == 0:
@@ -557,9 +605,13 @@ def run_sim(
             sim.render()
             if pov_viewer is not None:
                 try:
-                    drone_pos = np.asarray(sim.data.states.pos[0, pov_drone_idx])
+                    live_idx = get_live_pov()
+                    if live_idx is None or not (0 <= live_idx < sim.n_drones):
+                        live_idx = 0
+                    drone_pos = np.asarray(sim.data.states.pos[0, live_idx])
                     subj_pos = subject_position(t, subject_motion)
                     _aim_camera_at_subject(pov_viewer.cam, drone_pos, subj_pos)
+                    draw_subject_on_handle(pov_viewer, t, subject_motion)
                     pov_viewer.sync()
                 except Exception as exc:
                     print(f"[POV viewer] {exc}", file=sys.stderr)
@@ -571,6 +623,7 @@ def run_sim(
             pov_viewer.close()
         except Exception:
             pass
+    set_live_pov(None)
     sim.close()
     print("Done.")
     yield ("done", float(waypoints["time"][0, -1]), None)
@@ -696,12 +749,12 @@ def launch_ui(settings: dict) -> None:
         yield roles_md, parsed_json, "Planning complete; starting sim...", None
 
         if pov_drone in (None, "", "off"):
-            pov_idx = None
+            pov_indices = None
         else:
             try:
-                pov_idx = int(pov_drone)
+                pov_indices = [int(pov_drone)]
             except (TypeError, ValueError):
-                pov_idx = None
+                pov_indices = None
         effective_gui = show_viewer
 
         try:
@@ -709,7 +762,8 @@ def launch_ui(settings: dict) -> None:
             motion = parsed.get("subject", {}).get("motion", "figure_eight")
             for evt in run_sim(
                 waypoints, settings,
-                gui=effective_gui, subject_motion=motion, pov_drone_idx=pov_idx,
+                gui=effective_gui, subject_motion=motion,
+                pov_drone_indices=pov_indices,
             ):
                 kind, t, _payload = evt
                 if kind == "heartbeat":
@@ -730,13 +784,18 @@ def launch_ui(settings: dict) -> None:
             )
             submit_btn = gr.Button("Run", variant="primary", scale=1)
         with gr.Row():
-            viewer_chk = gr.Checkbox(value=True, label="Open MuJoCo 3D viewer window")
+            viewer_chk = gr.Checkbox(value=True, label="Open MuJoCo scene viewer")
             pov_radio = gr.Radio(
-                choices=[("Scene (default)", "off"), ("Drone 0 POV", "0"),
+                choices=[("Off (no POV window)", "off"), ("Drone 0 POV", "0"),
                          ("Drone 1 POV", "1"), ("Drone 2 POV", "2")],
-                value="off",
-                label="MuJoCo viewer camera (camera always points at the subject)",
+                value="0",
+                label="POV viewer at Run (does NOT switch live — use buttons below)",
             )
+        gr.Markdown("**Live POV switch** — click these while the sim is running:")
+        with gr.Row():
+            sw_d0 = gr.Button("Switch POV → Drone 0", size="sm")
+            sw_d1 = gr.Button("Switch POV → Drone 1", size="sm")
+            sw_d2 = gr.Button("Switch POV → Drone 2", size="sm")
         roles_out = gr.Markdown(label="Director's plan")
         with gr.Row():
             parsed_out = gr.Code(label="Parsed JSON (debug)", language="json")
@@ -745,6 +804,11 @@ def launch_ui(settings: dict) -> None:
         outputs = [roles_out, parsed_out, status_out, pov_out]
         submit_btn.click(submit, inputs=[cmd_in, viewer_chk, pov_radio], outputs=outputs)
         cmd_in.submit(submit, inputs=[cmd_in, viewer_chk, pov_radio], outputs=outputs)
+        # Live POV switch buttons — fire off-queue so they take effect immediately
+        # without restarting the sim.
+        sw_d0.click(fn=lambda: set_live_pov("0"), inputs=None, outputs=None, queue=False)
+        sw_d1.click(fn=lambda: set_live_pov("1"), inputs=None, outputs=None, queue=False)
+        sw_d2.click(fn=lambda: set_live_pov("2"), inputs=None, outputs=None, queue=False)
     ui.launch()
 
 

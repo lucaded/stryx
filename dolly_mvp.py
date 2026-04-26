@@ -23,7 +23,7 @@ OPENAI_MODEL = "gpt-4o"
 LLM_TIMEOUT_S = 20.0
 
 N_DRONES = 3
-DEFAULT_DURATION_S = 15.0
+DEFAULT_DURATION_S = 60.0
 WAYPOINT_DT_S = 0.25
 
 RADIUS_RANGE = (0.3, 2.0)
@@ -31,7 +31,7 @@ HEIGHT_RANGE = (0.5, 1.8)
 SPEED_RANGE = (0.1, 1.5)
 OFFSET_RANGE = (-1.5, 1.5)
 CENTER_RANGE = (-2.0, 2.0)
-DURATION_RANGE = (5.0, 30.0)
+DURATION_RANGE = (5.0, 90.0)
 FREEFORM_VOLUME_X = (-2.5, 2.5)
 FREEFORM_VOLUME_Y = (-2.5, 2.5)
 FREEFORM_VOLUME_Z = (0.5, 1.8)
@@ -42,15 +42,75 @@ FREEFORM_OUT_OF_VOLUME_FRACTION_LIMIT = 0.30
 SUBJECT_PERIOD_S = 12.0
 SUBJECT_AMPLITUDE_X = 1.2
 SUBJECT_AMPLITUDE_Y = 0.6
-SUBJECT_BOX_HALF = np.array([0.25, 0.25, 0.45])
-SUBJECT_BOX_RGBA = np.array([0.85, 0.25, 0.35, 1.0])
 POV_FORWARD_OFFSET = 0.12
+
+# Humanoid subject (built from MuJoCo primitives, drawn each render frame).
+# Sized to roughly match the original box so the original camera math frames it.
+HUMANOID_GROUND_Z = 0.02
+HUMANOID_LEG_HALF_H = 0.09
+HUMANOID_LEG_R = 0.035
+HUMANOID_BODY_HALF_H = 0.12
+HUMANOID_BODY_R = 0.085
+HUMANOID_ARM_HALF_H = 0.10
+HUMANOID_ARM_R = 0.025
+HUMANOID_HEAD_R = 0.07
+HUMANOID_PANTS_RGBA = np.array([0.10, 0.10, 0.12, 1.0])
+HUMANOID_JERSEY_RGBA = np.array([0.85, 0.18, 0.18, 1.0])
+HUMANOID_SKIN_RGBA = np.array([0.95, 0.80, 0.60, 1.0])
+HUMANOID_STEP_HZ = 1.6
+HUMANOID_STEP_AMPL = 0.03
+
+# Football pitch overlay (drawn each render frame on top of the default floor)
+PITCH_HALF_X = 2.5  # half-length (along x)
+PITCH_HALF_Y = 1.8  # half-width (along y)
+PITCH_LINE_WIDTH = 0.04
+PITCH_LINE_Z = 0.012
+PITCH_GRASS_RGBA = np.array([0.18, 0.55, 0.20, 1.0])
+PITCH_LINE_RGBA = np.array([0.95, 0.95, 0.95, 1.0])
+PITCH_GOAL_RGBA = np.array([0.95, 0.95, 0.95, 1.0])
+PITCH_CIRCLE_RADIUS = 0.55
+PITCH_CIRCLE_SEGMENTS = 18
+PITCH_PENALTY_LENGTH = 0.7
+PITCH_PENALTY_WIDTH = 1.4
+PITCH_GOAL_WIDTH = 0.7
+PITCH_GOAL_HEIGHT = 0.35
+PITCH_GOAL_POST_R = 0.025
 
 REPO_ROOT = Path(__file__).parent
 SETTINGS_PATH = REPO_ROOT / "swarm_gpt" / "data" / "settings.yaml"
 
 _live_pov_drone: int | None = None
 _live_pov_lock = threading.Lock()
+
+# Hot-swap: a single persistent sim thread runs forever; commands swap the active
+# waypoints atomically and AMSwarm replans from the current drone state.
+_pending_command_lock = threading.Lock()
+_pending_command: dict | None = None  # {"waypoints": dict, "motion": str}
+_persistent_started = threading.Event()
+_persistent_should_stop = threading.Event()
+_current_drone_state_lock = threading.Lock()
+_current_drone_state: dict | None = None  # {"pos": np.ndarray, "vel": np.ndarray, "abs_t": float}
+
+
+def _set_pending_command(parsed: dict) -> None:
+    motion = parsed.get("subject", {}).get("motion", "figure_eight")
+    abs_t = 0.0
+    with _current_drone_state_lock:
+        if _current_drone_state is not None:
+            abs_t = float(_current_drone_state["abs_t"])
+    waypoints = build_waypoints(parsed, start_abs_t=abs_t)
+    with _pending_command_lock:
+        global _pending_command
+        _pending_command = {"waypoints": waypoints, "motion": motion}
+    print(f"[hot-swap] queued new command at abs_t={abs_t:.2f}", file=sys.stderr)
+
+
+def _take_pending_command() -> dict | None:
+    with _pending_command_lock:
+        global _pending_command
+        cmd = _pending_command
+        _pending_command = None
+        return cmd
 
 
 def set_live_pov(value) -> None:
@@ -134,7 +194,7 @@ Decompose strategies:
   "subject": {"motion": "static"},
   "strategy": "<short_descriptor>",
   "rationale": "<one sentence justifying why no primitive fits>",
-  "duration": <seconds, 5-30>,
+  "duration": <seconds, 5-90>,
   "assignments": [
     {
       "drone": 0, "role": "<role>", "primitive": "freeform",
@@ -157,7 +217,7 @@ Hard parameter bounds:
 - orbit: radius [0.3, 2.0] m, height [0.5, 1.8] m, speed [0.1, 1.5] m/s, center each in [-2.0, 2.0] m
 - follow: |offset_x|, |offset_y| ≤ 1.5 m; height [0.5, 1.8] m
 - freeform: emit 6-10 waypoints per drone (denser = smoother). t strictly increasing, start 0.0, end at duration. x,y in [-2.5, 2.5] m, z in [0.5, 1.8] m. Vary trajectories per drone — three identical paths defeat the point. NEVER emit fewer than 6 waypoints unless the path is genuinely a single straight segment.
-- duration in [5, 30] s
+- duration in [5, 90] s
 
 All modes: exactly 3 assignments (drones 0, 1, 2). Always include a non-empty rationale."""
 
@@ -182,45 +242,236 @@ def subject_position(t: float | np.ndarray, mode: str) -> np.ndarray:
     return np.stack([x, y, z], axis=-1)
 
 
+def _line_box(cx: float, cy: float, half_x: float, half_y: float) -> tuple:
+    return (
+        int(mujoco.mjtGeom.mjGEOM_BOX),
+        np.array([cx, cy, PITCH_LINE_Z], dtype=np.float64),
+        np.array([half_x, half_y, PITCH_LINE_Z], dtype=np.float64),
+        np.eye(3).flatten().astype(np.float64),
+        PITCH_LINE_RGBA.astype(np.float32),
+    )
+
+
+def pitch_geoms() -> list[tuple]:
+    """Static football-pitch markings as (geom_type, pos, half_size, mat_flat, rgba) tuples."""
+    out: list[tuple] = []
+    half_w = PITCH_LINE_WIDTH / 2.0
+    # Grass overlay covers the playing area
+    out.append((
+        int(mujoco.mjtGeom.mjGEOM_BOX),
+        np.array([0.0, 0.0, 0.005], dtype=np.float64),
+        np.array([PITCH_HALF_X + 0.3, PITCH_HALF_Y + 0.3, 0.005], dtype=np.float64),
+        np.eye(3).flatten().astype(np.float64),
+        PITCH_GRASS_RGBA.astype(np.float32),
+    ))
+    # Perimeter (4 white lines)
+    out.append(_line_box(0.0, PITCH_HALF_Y, PITCH_HALF_X, half_w))
+    out.append(_line_box(0.0, -PITCH_HALF_Y, PITCH_HALF_X, half_w))
+    out.append(_line_box(-PITCH_HALF_X, 0.0, half_w, PITCH_HALF_Y))
+    out.append(_line_box(PITCH_HALF_X, 0.0, half_w, PITCH_HALF_Y))
+    # Halfway line
+    out.append(_line_box(0.0, 0.0, half_w, PITCH_HALF_Y))
+    # Center circle (small spheres along the circumference, sitting on top of floor)
+    circle_r = 0.035
+    for i in range(PITCH_CIRCLE_SEGMENTS):
+        theta = 2.0 * np.pi * i / PITCH_CIRCLE_SEGMENTS
+        out.append((
+            int(mujoco.mjtGeom.mjGEOM_SPHERE),
+            np.array([PITCH_CIRCLE_RADIUS * np.cos(theta),
+                      PITCH_CIRCLE_RADIUS * np.sin(theta),
+                      circle_r + 0.005], dtype=np.float64),
+            np.array([circle_r, circle_r, circle_r], dtype=np.float64),
+            np.eye(3).flatten().astype(np.float64),
+            PITCH_LINE_RGBA.astype(np.float32),
+        ))
+    # Penalty boxes at each end
+    pa_half_y = PITCH_PENALTY_WIDTH / 2.0
+    for end in (-1.0, 1.0):
+        front_x = end * (PITCH_HALF_X - PITCH_PENALTY_LENGTH)
+        # front line (perpendicular to length)
+        out.append(_line_box(front_x, 0.0, half_w, pa_half_y))
+        # two side lines (parallel to length)
+        side_cx = end * (PITCH_HALF_X - PITCH_PENALTY_LENGTH / 2.0)
+        out.append(_line_box(side_cx, pa_half_y, PITCH_PENALTY_LENGTH / 2.0, half_w))
+        out.append(_line_box(side_cx, -pa_half_y, PITCH_PENALTY_LENGTH / 2.0, half_w))
+    # Goals (two posts + crossbar) at each end, just outside the pitch line
+    g_half_w = PITCH_GOAL_WIDTH / 2.0
+    for end in (-1.0, 1.0):
+        x_goal = end * (PITCH_HALF_X + 0.05)
+        # left post
+        out.append((
+            int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+            np.array([x_goal, -g_half_w, PITCH_GOAL_HEIGHT / 2.0], dtype=np.float64),
+            np.array([PITCH_GOAL_POST_R, PITCH_GOAL_POST_R, PITCH_GOAL_HEIGHT / 2.0], dtype=np.float64),
+            np.eye(3).flatten().astype(np.float64),
+            PITCH_GOAL_RGBA.astype(np.float32),
+        ))
+        # right post
+        out.append((
+            int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+            np.array([x_goal, g_half_w, PITCH_GOAL_HEIGHT / 2.0], dtype=np.float64),
+            np.array([PITCH_GOAL_POST_R, PITCH_GOAL_POST_R, PITCH_GOAL_HEIGHT / 2.0], dtype=np.float64),
+            np.eye(3).flatten().astype(np.float64),
+            PITCH_GOAL_RGBA.astype(np.float32),
+        ))
+        # crossbar (horizontal box)
+        out.append((
+            int(mujoco.mjtGeom.mjGEOM_BOX),
+            np.array([x_goal, 0.0, PITCH_GOAL_HEIGHT], dtype=np.float64),
+            np.array([PITCH_GOAL_POST_R, g_half_w, PITCH_GOAL_POST_R], dtype=np.float64),
+            np.eye(3).flatten().astype(np.float64),
+            PITCH_GOAL_RGBA.astype(np.float32),
+        ))
+    return out
+
+
+_PITCH_GEOMS_CACHE: list[tuple] | None = None
+
+
+def _get_pitch_geoms() -> list[tuple]:
+    global _PITCH_GEOMS_CACHE
+    if _PITCH_GEOMS_CACHE is None:
+        _PITCH_GEOMS_CACHE = pitch_geoms()
+    return _PITCH_GEOMS_CACHE
+
+
+def draw_pitch_on_scene(sim: Sim) -> None:
+    # Pitch overlay disabled — was causing rendering interference with the subject geom
+    # in the POV viewer's user_scn. Keep the call site for easy re-enable.
+    return
+
+
+def _push_geom_to_user_scn(scn, typ, pos, size, mat, rgba) -> None:
+    if scn.ngeom >= scn.maxgeom:
+        return
+    g = scn.geoms[scn.ngeom]
+    mujoco.mjv_initGeom(g, int(typ), size, pos, mat, rgba)
+    scn.ngeom += 1
+
+
+def humanoid_geoms(t: float, motion: str) -> list[tuple]:
+    """Return (geom_type, pos, half_size, mat_flat, rgba) for a stick humanoid at subject(t).
+
+    Body parts oscillate to suggest a walking gait. Limbs swing in world-y rather
+    than along the heading; cosmetically off-axis but readable as "walking".
+    """
+    pos = subject_position(t, motion)
+    sx, sy = float(pos[0]), float(pos[1])
+    eye3 = np.eye(3).flatten().astype(np.float64)
+    omega = 2.0 * np.pi * HUMANOID_STEP_HZ
+    swing = HUMANOID_STEP_AMPL * np.sin(omega * t)
+    bob = 0.012 * np.cos(2.0 * omega * t)
+
+    leg_z = HUMANOID_GROUND_Z + HUMANOID_LEG_HALF_H
+    body_z = leg_z + HUMANOID_LEG_HALF_H + HUMANOID_BODY_HALF_H + bob
+    head_z = body_z + HUMANOID_BODY_HALF_H + HUMANOID_HEAD_R + 0.02
+
+    out: list[tuple] = []
+
+    # Legs (left, right) — alternating fore/aft step
+    for sign in (-1.0, 1.0):
+        out.append((
+            int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+            np.array([sx + sign * 0.045, sy + sign * swing, leg_z], dtype=np.float64),
+            np.array([HUMANOID_LEG_R, HUMANOID_LEG_R, HUMANOID_LEG_HALF_H], dtype=np.float64),
+            eye3,
+            HUMANOID_PANTS_RGBA.astype(np.float32),
+        ))
+
+    # Body
+    out.append((
+        int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+        np.array([sx, sy, body_z], dtype=np.float64),
+        np.array([HUMANOID_BODY_R, HUMANOID_BODY_R, HUMANOID_BODY_HALF_H], dtype=np.float64),
+        eye3,
+        HUMANOID_JERSEY_RGBA.astype(np.float32),
+    ))
+
+    # Arms — swing opposite to same-side leg
+    for sign in (-1.0, 1.0):
+        out.append((
+            int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+            np.array([sx + sign * (HUMANOID_BODY_R + HUMANOID_ARM_R + 0.02),
+                      sy - sign * swing,
+                      body_z], dtype=np.float64),
+            np.array([HUMANOID_ARM_R, HUMANOID_ARM_R, HUMANOID_ARM_HALF_H], dtype=np.float64),
+            eye3,
+            HUMANOID_SKIN_RGBA.astype(np.float32),
+        ))
+
+    # Head
+    out.append((
+        int(mujoco.mjtGeom.mjGEOM_SPHERE),
+        np.array([sx, sy, head_z], dtype=np.float64),
+        np.array([HUMANOID_HEAD_R, HUMANOID_HEAD_R, HUMANOID_HEAD_R], dtype=np.float64),
+        eye3,
+        HUMANOID_SKIN_RGBA.astype(np.float32),
+    ))
+
+    return out
+
+
 def draw_subject(sim: Sim, t: float, motion: str) -> None:
-    """Draw the subject as a moving box on the ground (scene viewer only)."""
+    """Draw a red box at the subject's position in the scene viewer."""
     if sim.viewer is None or sim.viewer.viewer is None:
         return
     viewer = sim.viewer.viewer
     pos = subject_position(t, motion)
-    box_pos = np.array([pos[0], pos[1], SUBJECT_BOX_HALF[2]], dtype=np.float64)
+    box_pos = np.array([pos[0], pos[1], SUBJECT_POV_BOX_HALF[2]], dtype=np.float64)
     viewer.add_marker(
-        type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=SUBJECT_BOX_HALF,
+        type=SUBJECT_GEOM_TYPE,
+        size=SUBJECT_POV_BOX_HALF,
         pos=box_pos,
         mat=np.eye(3).flatten(),
-        rgba=SUBJECT_BOX_RGBA,
+        rgba=SUBJECT_POV_BOX_RGBA,
     )
 
 
-def draw_subject_on_handle(handle, t: float, motion: str) -> None:
-    """Add the subject box to a mujoco passive-viewer Handle's user_scn."""
+_pov_diag_logged = False
+_pov_cam_diag_logged = False
+SUBJECT_POV_BOX_HALF = np.array([0.25, 0.25, 0.45])
+SUBJECT_POV_BOX_RGBA = np.array([0.85, 0.25, 0.35, 1.0])
+SUBJECT_GEOM_TYPE = int(mujoco.mjtGeom.mjGEOM_BOX)
+SUBJECT_FLOOR_OFFSET = 0.0
+
+
+def _log_pov_cam_once(drone_pos, subj_pos):
+    global _pov_cam_diag_logged
+    if not _pov_cam_diag_logged:
+        print(f"[POV cam] drone_pos={np.asarray(drone_pos)}  lookat={subj_pos}",
+              file=sys.stderr)
+        _pov_cam_diag_logged = True
+
+
+def draw_pitch_and_subject_on_handle(handle, t: float, motion: str) -> None:
+    """Pitch + a single box for the subject, populated in the POV viewer's user_scn.
+
+    Pitch and humanoid breakdown stay in the scene viewer via add_marker.
+    """
+    global _pov_diag_logged
     if handle is None:
         return
     try:
         scn = handle.user_scn
+        if not _pov_diag_logged:
+            print(f"[POV scn] maxgeom={scn.maxgeom}", file=sys.stderr)
+            _pov_diag_logged = True
         if scn.maxgeom == 0:
             return
         pos = subject_position(t, motion)
-        box_pos = np.array([pos[0], pos[1], SUBJECT_BOX_HALF[2]], dtype=np.float64)
+        box_pos = np.array([pos[0], pos[1], SUBJECT_POV_BOX_HALF[2]], dtype=np.float64)
         with handle.lock():
             scn.ngeom = 1
-            g = scn.geoms[0]
             mujoco.mjv_initGeom(
-                g,
-                int(mujoco.mjtGeom.mjGEOM_BOX),
-                np.asarray(SUBJECT_BOX_HALF, dtype=np.float64),
+                scn.geoms[0],
+                SUBJECT_GEOM_TYPE,
+                np.asarray(SUBJECT_POV_BOX_HALF, dtype=np.float64),
                 box_pos,
                 np.eye(3).flatten().astype(np.float64),
-                np.asarray(SUBJECT_BOX_RGBA, dtype=np.float32),
+                np.asarray(SUBJECT_POV_BOX_RGBA, dtype=np.float32),
             )
     except Exception as exc:
-        print(f"[POV box] {exc}", file=sys.stderr)
+        print(f"[POV scene] {exc}", file=sys.stderr)
 
 
 # ---------- LLM ----------
@@ -391,13 +642,14 @@ def validate_freeform_or_fallback(parsed: dict) -> tuple[dict, str | None]:
 
 # ---------- waypoint generation ----------
 
-def _fill_orbit(pos_arr, vel_arr, times, drone_i, n_drones, params, subject_motion):
+def _fill_orbit(pos_arr, vel_arr, times, drone_i, n_drones, params, subject_motion,
+                start_abs_t: float = 0.0):
     radius = params["radius"]
     height = params["height"]
     speed = params["speed"]
     cx, cy = params["center"]
     if subject_motion != "static":
-        subj = subject_position(times, subject_motion)
+        subj = subject_position(times + start_abs_t, subject_motion)
         cxs = subj[:, 0] + cx
         cys = subj[:, 1] + cy
         if len(times) > 1:
@@ -422,10 +674,11 @@ def _fill_orbit(pos_arr, vel_arr, times, drone_i, n_drones, params, subject_moti
     vel_arr[:, 2] = 0.0
 
 
-def _fill_follow(pos_arr, vel_arr, times, params, subject_motion):
+def _fill_follow(pos_arr, vel_arr, times, params, subject_motion,
+                 start_abs_t: float = 0.0):
     dx, dy = params["offset"]
     height = params["height"]
-    subj = subject_position(times, subject_motion)
+    subj = subject_position(times + start_abs_t, subject_motion)
     pos_arr[:, 0] = subj[:, 0] + dx
     pos_arr[:, 1] = subj[:, 1] + dy
     pos_arr[:, 2] = height
@@ -459,7 +712,7 @@ def _fill_freeform(pos_arr, vel_arr, times, waypoints):
         vel_arr[-1] = vel_arr[-2]
 
 
-def build_waypoints(parsed: dict) -> dict[str, np.ndarray]:
+def build_waypoints(parsed: dict, start_abs_t: float = 0.0) -> dict[str, np.ndarray]:
     duration = float(parsed.get("duration", DEFAULT_DURATION_S))
     motion = parsed.get("subject", {}).get("motion", "static")
     n = len(parsed["assignments"])
@@ -472,9 +725,9 @@ def build_waypoints(parsed: dict) -> dict[str, np.ndarray]:
         a = by_idx[i]
         prim = a["primitive"]
         if prim == "orbit":
-            _fill_orbit(pos[i], vel[i], times, i, n, a["params"], motion)
+            _fill_orbit(pos[i], vel[i], times, i, n, a["params"], motion, start_abs_t)
         elif prim == "follow":
-            _fill_follow(pos[i], vel[i], times, a["params"], motion)
+            _fill_follow(pos[i], vel[i], times, a["params"], motion, start_abs_t)
         elif prim == "freeform":
             _fill_freeform(pos[i], vel[i], times, a.get("waypoints", []))
         else:
@@ -491,9 +744,14 @@ POV_FPS = 4
 STATUS_HEARTBEAT_HZ = 2
 
 
+POV_AIM_Z = 0.30  # aim slightly above subject ground so a short humanoid is framed
+
+
 def _aim_camera_at_subject(cam, drone_pos, subject_pos):
+    """Camera at drone position (offset slightly forward), looking at the subject."""
     drone = np.asarray(drone_pos, dtype=np.float64)
-    subj = np.asarray(subject_pos, dtype=np.float64)
+    subj = np.asarray(subject_pos, dtype=np.float64).copy()
+    subj[2] = POV_AIM_Z
     to_subject = subj - drone
     norm = float(np.linalg.norm(to_subject))
     cam_world = drone + (to_subject / norm) * POV_FORWARD_OFFSET if norm > 1e-6 else drone
@@ -567,7 +825,7 @@ def run_sim(
     pos = np.asarray(sim.data.states.pos[0])
     vel = np.asarray(sim.data.states.vel[0])
 
-    # Second MuJoCo viewer for the drone POV; stays in lockstep with the scene viewer.
+    # Two windows: scene viewer (free camera, user controls) and POV viewer (locked).
     pov_viewer = None
     if pov_drone_indices and gui:
         try:
@@ -601,6 +859,7 @@ def run_sim(
         sim.state_control(control)
         sim.step(sim.freq // sim.control_freq)
         if gui and (step * fps) % sim.control_freq < fps:
+            draw_pitch_on_scene(sim)
             draw_subject(sim, t, subject_motion)
             sim.render()
             if pov_viewer is not None:
@@ -610,23 +869,192 @@ def run_sim(
                         live_idx = 0
                     drone_pos = np.asarray(sim.data.states.pos[0, live_idx])
                     subj_pos = subject_position(t, subject_motion)
+                    _log_pov_cam_once(drone_pos, subj_pos)
                     _aim_camera_at_subject(pov_viewer.cam, drone_pos, subj_pos)
-                    draw_subject_on_handle(pov_viewer, t, subject_motion)
+                    draw_pitch_and_subject_on_handle(pov_viewer, t, subject_motion)
                     pov_viewer.sync()
                 except Exception as exc:
                     print(f"[POV viewer] {exc}", file=sys.stderr)
         heartbeat_every = max(1, sim.control_freq // STATUS_HEARTBEAT_HZ)
         if step % heartbeat_every == 0:
             yield ("heartbeat", t, None)
+    set_live_pov(None)
+    sim.close()
+    print("Done.")
+    yield ("done", float(waypoints["time"][0, -1]), None)
+
+
+# ---------- persistent (hot-swap) sim ----------
+
+def _make_hover_waypoints(pos: np.ndarray, duration: float = 60.0) -> dict[str, np.ndarray]:
+    """Hover-in-place waypoints for the current drone positions (used as the initial plan)."""
+    n = pos.shape[0]
+    n_samples = max(2, int(np.ceil(duration / WAYPOINT_DT_S)) + 1)
+    times = np.linspace(0.0, duration, n_samples)
+    p = np.zeros((n, n_samples, 3), dtype=np.float64)
+    for i in range(n):
+        p[i, :, :] = pos[i]
+    v = np.zeros_like(p)
+    t = np.tile(times, (n, 1))
+    return {"time": t, "pos": p, "vel": v, "acc": np.zeros_like(p)}
+
+
+def persistent_sim_thread(settings: dict, gui: bool, n_drones: int = N_DRONES) -> None:
+    """Long-running sim loop. Reads pending commands and hot-swaps waypoints.
+
+    Runs in its own thread. Started lazily on the first command from the UI.
+    """
+    print("[hot-swap] starting persistent sim", file=sys.stderr)
+    sim = Sim(
+        n_worlds=1,
+        n_drones=n_drones,
+        physics=Physics.analytical,
+        control=Control.state,
+        freq=settings["sim_freq"],
+        attitude_freq=settings["attitude_freq"],
+        state_freq=settings["state_freq"],
+        device="cpu",
+    )
+    sim.max_visual_geom = 100_000
+    sim.reset()
+    sim.state_control(np.zeros((sim.n_worlds, sim.n_drones, 13), dtype=np.float32))
+    sim.step(sim.freq // sim.control_freq)
+    sim.reset()
+
+    # Spread drones to distinct hover positions so AMSwarm collision-avoidance has
+    # a feasible plan from the very first solve. Default positions in crazyflow's
+    # scene tend to stack drones, which can deadlock the solver on init.
+    init_pos = np.array(
+        [[-0.7, 0.0, 1.0], [0.0, 0.0, 1.2], [0.7, 0.0, 1.0]],
+        dtype=np.float64,
+    )[: sim.n_drones]
+    if init_pos.shape[0] == sim.n_drones:
+        pos_init_jax = sim.data.states.pos.at[0, ...].set(init_pos)
+        sim.data = sim.data.replace(states=sim.data.states.replace(pos=pos_init_jax))
+
+    solver_settings_kwargs = {
+        k: (np.asarray(v) if isinstance(v, list) else v)
+        for k, v in settings["axswarm"].items()
+    }
+    solver_settings = SolverSettings(**solver_settings_kwargs)
+    dyn = settings["Dynamics"]
+    A, B = np.asarray(dyn["A"]), np.asarray(dyn["B"])
+    A_prime, B_prime = np.asarray(dyn["A_prime"]), np.asarray(dyn["B_prime"])
+
+    pos = np.asarray(sim.data.states.pos[0])
+    vel = np.asarray(sim.data.states.vel[0])
+
+    pov_viewer = None
+    if gui:
+        try:
+            import mujoco.viewer as _mjv
+            pov_viewer = _mjv.launch_passive(
+                sim.mj_model, sim.mj_data,
+                show_left_ui=False, show_right_ui=False,
+            )
+        except Exception as exc:
+            print(f"[hot-swap POV] {exc}", file=sys.stderr)
+            pov_viewer = None
+
+    # Initial trajectory: hover in place
+    current_waypoints = _make_hover_waypoints(pos, duration=60.0)
+    current_motion = "static"
+    solver_data = SolverData.init(
+        waypoints=current_waypoints,
+        K=solver_settings.K, N=solver_settings.N,
+        A=A, B=B, A_prime=A_prime, B_prime=B_prime,
+        freq=solver_settings.freq,
+        smoothness_weight=solver_settings.smoothness_weight,
+        input_smoothness_weight=solver_settings.input_smoothness_weight,
+        input_continuity_weight=solver_settings.input_continuity_weight,
+    )
+
+    solve_every_n_steps = sim.control_freq // solver_settings.freq
+    fps = 60
+    control = np.zeros((sim.n_worlds, sim.n_drones, 13), dtype=np.float32)
+
+    step = 0
+    command_start_step = 0
+    print("[hot-swap] entering loop", file=sys.stderr)
+    while not _persistent_should_stop.is_set():
+        # Hot-swap: pull a pending command if any
+        pending = _take_pending_command()
+        if pending is not None:
+            current_waypoints = pending["waypoints"]
+            current_motion = pending["motion"]
+            solver_data = SolverData.init(
+                waypoints=current_waypoints,
+                K=solver_settings.K, N=solver_settings.N,
+                A=A, B=B, A_prime=A_prime, B_prime=B_prime,
+                freq=solver_settings.freq,
+                smoothness_weight=solver_settings.smoothness_weight,
+                input_smoothness_weight=solver_settings.input_smoothness_weight,
+                input_continuity_weight=solver_settings.input_continuity_weight,
+            )
+            command_start_step = step
+            print(f"[hot-swap] swapped to new command, motion={current_motion}",
+                  file=sys.stderr)
+
+        rel_t = (step - command_start_step) / sim.control_freq
+        abs_t = step / sim.control_freq
+
+        # Publish current drone state for the next command's waypoint generation
+        with _current_drone_state_lock:
+            global _current_drone_state
+            _current_drone_state = {
+                "pos": pos.copy(),
+                "vel": vel.copy(),
+                "abs_t": abs_t,
+            }
+
+        if step % solve_every_n_steps == 0:
+            state = np.concatenate((pos, vel), axis=-1)
+            success, _, solver_data = solve(state, rel_t, solver_data, solver_settings)
+            jax.block_until_ready(solver_data)
+            solver_data = solver_data.step(solver_data)
+            pos = np.asarray(solver_data.u_pos[:, 0])
+            vel = np.asarray(solver_data.u_vel[:, 0])
+            control[0, :, :3] = solver_data.u_pos[:, 0]
+            control[0, :, 3:6] = solver_data.u_vel[:, 0]
+
+        sim.state_control(control)
+        sim.step(sim.freq // sim.control_freq)
+
+        if gui and (step * fps) % sim.control_freq < fps:
+            draw_subject(sim, abs_t, current_motion)
+            sim.render()
+            if pov_viewer is not None:
+                try:
+                    live_idx = get_live_pov()
+                    if live_idx is None or not (0 <= live_idx < sim.n_drones):
+                        live_idx = 0
+                    drone_pos = np.asarray(sim.data.states.pos[0, live_idx])
+                    subj_pos = subject_position(abs_t, current_motion)
+                    _aim_camera_at_subject(pov_viewer.cam, drone_pos, subj_pos)
+                    draw_pitch_and_subject_on_handle(pov_viewer, abs_t, current_motion)
+                    pov_viewer.sync()
+                except Exception as exc:
+                    print(f"[hot-swap POV] {exc}", file=sys.stderr)
+
+        step += 1
+
     if pov_viewer is not None:
         try:
             pov_viewer.close()
         except Exception:
             pass
-    set_live_pov(None)
     sim.close()
-    print("Done.")
-    yield ("done", float(waypoints["time"][0, -1]), None)
+    print("[hot-swap] sim stopped", file=sys.stderr)
+
+
+def ensure_persistent_sim(settings: dict, gui: bool) -> None:
+    if _persistent_started.is_set():
+        return
+    _persistent_started.set()
+    _persistent_should_stop.clear()
+    threading.Thread(
+        target=persistent_sim_thread, args=(settings, gui), daemon=True
+    ).start()
 
 
 # ---------- presentation ----------
@@ -746,33 +1174,23 @@ def launch_ui(settings: dict) -> None:
             return
         roles_md = render_roles_markdown(parsed)
         parsed_json = json.dumps(parsed, indent=2)
-        yield roles_md, parsed_json, "Planning complete; starting sim...", None
 
         if pov_drone in (None, "", "off"):
-            pov_indices = None
+            pass
         else:
             try:
-                pov_indices = [int(pov_drone)]
-            except (TypeError, ValueError):
-                pov_indices = None
-        effective_gui = show_viewer
+                set_live_pov(pov_drone)
+            except Exception:
+                pass
 
+        # Start the persistent sim once; subsequent commands hot-swap waypoints.
+        ensure_persistent_sim(settings, gui=show_viewer)
         try:
-            waypoints = build_waypoints(parsed)
-            motion = parsed.get("subject", {}).get("motion", "figure_eight")
-            for evt in run_sim(
-                waypoints, settings,
-                gui=effective_gui, subject_motion=motion,
-                pov_drone_indices=pov_indices,
-            ):
-                kind, t, _payload = evt
-                if kind == "heartbeat":
-                    yield roles_md, parsed_json, f"t={t:.1f}s", None
-                elif kind == "done":
-                    yield roles_md, parsed_json, "Done.", None
+            _set_pending_command(parsed)
         except Exception as exc:
-            yield roles_md, parsed_json, f"Sim error: {exc}", None
+            yield roles_md, parsed_json, f"Hot-swap error: {exc}", None
             return
+        yield roles_md, parsed_json, "Command queued — drones will smoothly transition.", None
 
     with gr.Blocks(title="dolly MVP") as ui:
         gr.Markdown("# dolly MVP — central-planner swarm cinematography")
